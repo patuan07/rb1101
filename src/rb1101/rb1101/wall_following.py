@@ -8,11 +8,11 @@ from numpy.linalg import norm
 import time
 from rclpy.logging import set_logger_level, LoggingSeverity
 
-
+# Change1
 np.set_printoptions(2, suppress=True) # Print numpy arrays to specified d.p. and suppress scientific notation (e.g. 1e-5)
 set_logger_level("WallFollowingNode", level=LoggingSeverity.INFO) # Configure to either LoggingSeverity.DEBUG instead to print more details during run
 
-is_simulation = True
+is_simulation = False
 
 if is_simulation:
     # Simulation settings
@@ -42,20 +42,61 @@ else:
         ('ransac.inliers_decrease_factor', 5), # 3
         ('ransac.max_iter', 20), # 100
         ('ransac.point_distance_threshold', 0.03), # 0.01
-        ('translate_velocity', 0.2), # Feel free to toggle this speed, but be aware that the robot may miss walls at higher speeds
+        ('translate_velocity', 0.30), # Feel free to toggle this speed, but be aware that the robot may miss walls at higher speeds
         ('translate_limit', 0.4), # DO NOT CHANGE THIS LIMIT; marks will be penalised for changing irl speed limits
-        ('turn_velocity', 0.6),
+        ('turn_velocity', 0.80),
         ('turn_limit', 1.0), # DO NOT CHANGE THIS LIMIT; marks will be penalised for changing irl speed limits
-        ('diagonal_x_threshold', (0.05, 0.5)), # (min, max) thresholds for wall detection on left/right/diagonal walls
-        ('diagonal_y_threshold', (0.05, 0.5)), # (min, max) thresholds for wall detection on left/right/diagonal walls
+        ('diagonal_x_threshold', (0.07, 0.5)), # (min, max) thresholds for wall detection on left/right/diagonal walls
+        ('diagonal_y_threshold', (0.07, 0.5)), # (min, max) thresholds for wall detection on left/right/diagonal walls
         ('robot_dimensions', (0.1, 0.05)),  # Length x Width
         ('vertical_threshold', 0.25), # Front threshold distance to wall
-        ('right_wall_buffer_distance', 0.16),
+        ('right_wall_buffer_distance', 0.12),
         ('angle_tolerance', 15),
         ('slide_correction_factor', 4),
         ('turn_correction_factor', 1)
     ]
 
+
+# def ransac(points,maxIter,threshold,d):
+#     '''RANSAC (Random Sample Consensus) implementation modified from https://github.com/creminem94/Advanced-Wall-Following/tree/main'''
+#     i = 0
+#     bestLine = None
+#     bestB = None
+#     bestC = None
+#     bestInliers = list()
+#     bestOutliers = list()
+#     random.seed()
+#     while i < maxIter:
+#         i = i+1
+#         idx1 = random.randrange(len(points))
+#         idx2 = random.randrange(len(points))
+#         while idx2 == idx1:
+#             idx2 = random.randrange(len(points))
+        
+#         #model
+#         B = points[idx1]
+#         C = points[idx2]
+#         inliers = list()
+#         outliers = list()
+#         for j  in range(0, len(points)):
+#             if j == idx1 or j == idx2:
+#                 continue
+#             A = points[j]
+#             dist = point2lineDist(A,B,C)
+#             if abs(dist) <= threshold:
+#                 inliers.append(A)
+#             else:
+#                 outliers.append(A)
+
+#         if len(inliers) >= d:
+#             bestLine = np.polyfit(inliers[0], inliers[1], 1)
+#             bestB = B
+#             bestC = C
+#             bestInliers = inliers
+#             bestOutliers = outliers
+#             break
+    
+#     return bestLine, bestB, bestC, bestInliers, bestOutliers
 
 def ransac(points,maxIter,threshold,d):
     '''RANSAC (Random Sample Consensus) implementation modified from https://github.com/creminem94/Advanced-Wall-Following/tree/main'''
@@ -68,12 +109,14 @@ def ransac(points,maxIter,threshold,d):
     random.seed()
     while i < maxIter:
         i = i+1
+        if len(points) < 2:
+            break
         idx1 = random.randrange(len(points))
         idx2 = random.randrange(len(points))
         while idx2 == idx1:
             idx2 = random.randrange(len(points))
         
-        #model
+        # model (two sample points)
         B = points[idx1]
         C = points[idx2]
         inliers = list()
@@ -88,8 +131,28 @@ def ransac(points,maxIter,threshold,d):
             else:
                 outliers.append(A)
 
-        if len(inliers) >= d:
-            bestLine = np.polyfit(inliers[0], inliers[1], 1)
+        # need at least two points to define a line
+        if len(inliers) >= d and len(inliers) >= 2:
+            inliers_np = np.asarray(inliers)
+            x = inliers_np[:,0]
+            y = inliers_np[:,1]
+            # If x variance is too small, treat as vertical line
+            if np.ptp(x) < 1e-6:
+                # represent vertical line as slope = np.inf, intercept = x_constant
+                m = np.inf
+                c = np.mean(x)  # x = c
+            else:
+                # robust slope/intercept via least squares (avoids RankWarning from np.polyfit)
+                xm = x.mean()
+                ym = y.mean()
+                denom = np.sum((x - xm)**2)
+                if denom == 0:
+                    m = 0.0
+                    c = ym
+                else:
+                    m = np.sum((x - xm) * (y - ym)) / denom
+                    c = ym - m * xm
+            bestLine = (m, c)
             bestB = B
             bestC = C
             bestInliers = inliers
@@ -97,7 +160,6 @@ def ransac(points,maxIter,threshold,d):
             break
     
     return bestLine, bestB, bestC, bestInliers, bestOutliers
-
 
 def point2lineDist(A,B,C):
     '''Helper function for ransac()'''
@@ -120,9 +182,20 @@ class WallFollowingNode(Node):
         self.ransacLineParams = []
         self.cooldown = 0
         self.last_scan = None
-
+        # Add your own variables here: Track direction?
+        
         self.declare_parameters(namespace='', parameters=parameters)
 
+    # def odom_callback(self, msg: Odometry):
+    #     """Update self.heading (degrees, -180..180) from odometry quaternion"""
+    #     q = msg.pose.pose.orientation
+    #     roll, pitch, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+    #     heading_deg = np.rad2deg(yaw) % 360
+    #     if heading_deg > 180:
+    #         heading_deg -= 360
+    #     self.heading = heading_deg
+    #     # optional debug
+    #     self.get_logger().debug(f"Heading updated: {self.heading:.1f} deg")
 
     def sub_scan_callback(self, msg):
         """Scan subscriber"""
@@ -211,6 +284,7 @@ class WallFollowingNode(Node):
                 y_condition = np.logical_and(diagonal_y_threshold[0] < abs(scan_slice[:,1]), abs(scan_slice[:,1]) < diagonal_y_threshold[1])
                 scans_within_sector_indices = np.logical_and(x_condition, y_condition)
             elif idx == 2 or idx == 6: # Left or right
+                scan_slice = scan_coordinates[idx*45-20:idx*45+20]
                 x_condition = np.abs(scan_slice[:,0]) < dimensions[0]
                 y_condition = np.abs(scan_slice[:,1]) < diagonal_y_threshold[1] * 1.3
                 scans_within_sector_indices = np.logical_and(x_condition, y_condition)
@@ -226,7 +300,7 @@ class WallFollowingNode(Node):
         # Do an extra check for the back right wall (since that's used for right-wall following) to make sure wall detected is parallel to robot
         right_corner_wall = False
         for line in self.back_right_lines:
-            if abs(line["angle"]) < 40:
+            if abs(line["angle"]) < 30:
                 x_condition = -diagonal_x_threshold[1] < max(line["p1"][0], line["p2"][0]) and min(line["p1"][0], line["p2"][0]) < -dimensions[0]
                 y_condition = -diagonal_y_threshold[1] < max(line["p1"][1], line["p2"][1]) and min(line["p1"][1], line["p2"][1]) < -dimensions[1]
                 if x_condition and y_condition and wall_detected_arr[5] == 1: # meaning there's a wall that crosses the corner right sector and is roughly parallel with the robot
@@ -269,7 +343,7 @@ class WallFollowingNode(Node):
         '''Hardcoded 90deg turn based on turn velocity'''
         self.get_logger().debug("Turn left 90deg")
         turn_velocity = self.get_parameter('turn_velocity').value
-        for _ in range(50):
+        for _ in range(40):
             self.move_2D(0.0, 0.0, turn_velocity)
             time.sleep(0.05)
         self.get_logger().debug("Turn complete")
@@ -280,12 +354,13 @@ class WallFollowingNode(Node):
         '''Hardcoded 90deg turn based on turn velocity'''
         self.get_logger().debug("Turn right 90deg")
         turn_velocity = self.get_parameter('turn_velocity').value
-        for _ in range(50):
+        for _ in range(40):
             self.move_2D(0.0, 0.0, -turn_velocity)
             time.sleep(0.05)
         self.get_logger().debug("Turn complete")
         self.cooldown = 5
         self.last_scan = None
+    
 
 
     def stop(self):
@@ -333,9 +408,25 @@ class WallFollowingNode(Node):
                     self.move_2D(0.1) # Move slowly to get closer to wall
 
         ###### INSERT CODE HERE ######
+
+        '''
+        Logic: if corner is detected
+        '''
         if wall_array[0]: # Wall in-front
-            self.get_logger().info("wall front, turn left")
+
+            self.heading += 90 # Turn Left
+            self.get_logger().info(f"wall back-right, turn right, heading: {self.heading}")
             self.turn_left_90deg()
+
+        elif wall_array[5] and not wall_array[6]: # Wall back-right only -> Corner
+            # if self.heading % 360 != 0: # for wall-following with direction
+            if self.heading != 0: # pledge algo
+                self.heading -= 90
+                self.get_logger().info(f"wall back-right, turn right, heading: {self.heading}")
+                self.turn_right_90deg()
+            else:
+                self.get_logger().info(f"wall back-right, move forward, heading: {self.heading}")
+                self.move_forward(turn_offset=turn_offset, align=True)
 
         elif wall_array[6]: # Wall right
             self.get_logger().info("wall right, move forward")
@@ -358,4 +449,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
